@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class HubertNarrow(nn.Module):
+class Hubert(nn.Module):
     def __init__(self, num_label_embeddings: int = 100, mask: bool = True):
         super().__init__()
         self._mask = mask
@@ -24,10 +24,10 @@ class HubertNarrow(nn.Module):
             ),
             12,
         )
-        self.proj = nn.Linear(768, 128) # ==> Modification de la taille des représentations
+        self.proj = nn.Linear(768, 256)
 
         self.masked_spec_embed = nn.Parameter(torch.FloatTensor(768).uniform_())
-        self.label_embedding = nn.Embedding(num_label_embeddings, 128) # ==> Modification de la taille des représentations
+        self.label_embedding = nn.Embedding(num_label_embeddings, 256)
 
     def mask(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         mask = None
@@ -61,7 +61,29 @@ class HubertNarrow(nn.Module):
         logits = self.logits(x)
         return logits, mask
 
-class HubertDiscrete(HubertNarrow):
+
+class HubertSoft(Hubert):
+    """HuBERT-Soft content encoder from `"A Comparison of Discrete and Soft Speech Units for Improved Voice Conversion"`."""
+
+    def __init__(self):
+        super().__init__()
+
+    @torch.inference_mode()
+    def units(self, wav: torch.Tensor) -> torch.Tensor:
+        """Extract soft speech units.
+
+        Args:
+            wav (Tensor): an audio waveform of shape (1, 1, T), where T is the number of samples.
+
+        Returns:
+            Tensor: soft speech units of shape (1, N, D), where N is the number of frames and D is the unit dimensions.
+        """
+        wav = F.pad(wav, ((400 - 320) // 2, (400 - 320) // 2))
+        x, _ = self.encode(wav)
+        return self.proj(x)
+
+
+class HubertDiscrete(Hubert):
     """HuBERT-Discrete content encoder from `"A Comparison of Discrete and Soft Speech Units for Improved Voice Conversion"`."""
 
     def __init__(self, kmeans: KMeans):
@@ -82,6 +104,7 @@ class HubertDiscrete(HubertNarrow):
         x, _ = self.encode(wav, layer=7)
         x = self.kmeans.predict(x.squeeze().cpu().numpy())
         return torch.tensor(x, dtype=torch.long, device=wav.device)
+
 
 class FeatureExtractor(nn.Module):
     def __init__(self):
