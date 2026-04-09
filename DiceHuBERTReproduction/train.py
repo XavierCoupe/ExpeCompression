@@ -14,10 +14,10 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
-
-from hubert.model import Hubert, URLS
-from hubert.dataset import AcousticUnitsDataset
-from hubert.utils import Metric, save_checkpoint, load_checkpoint
+from transformers import AutoModelForCTC
+from student.model import HubertDiscrete
+from student.dataset import AcousticUnitsDataset
+from student.utils import Metric, save_checkpoint, load_checkpoint
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -73,29 +73,20 @@ def train(rank, world_size, args):
     # Initialize models
     ####################################################################################
 
-    hubert = Hubert(mask=args.mask).to(rank)
+    ###
+    # Initialize Student
+    ###
 
-    if args.warmstart:
-        checkpoint = torch.hub.load_state_dict_from_url(
-            URLS["hubert-discrete"], map_location={"cuda:0": f"cuda:{rank}"}
-        )
-        consume_prefix_in_state_dict_if_present(checkpoint["hubert"], "module.")
+    student_dicehubert = HubertDiscrete(mask=args.mask).to(rank)
+    student_dicehubert = DDP(student_dicehubert, device_ids=[rank])
 
-        # don't use warmstart weights for label embeddings and proj layer
-        del checkpoint["hubert"]["label_embedding.weight"]
-        del checkpoint["hubert"]["proj.weight"]
-        del checkpoint["hubert"]["proj.bias"]
-
-        hubert.load_state_dict(checkpoint["hubert"], strict=False)
-
-    hubert = DDP(hubert, device_ids=[rank])
 
     ####################################################################################
-    # Initialze optimizer and grad scaler
+    # Initialize optimizer and grad scaler
     ####################################################################################
 
     optimizer = optim.AdamW(
-        hubert.parameters(),
+        student_dicehubert.parameters(),
         lr=LEARNING_RATE,
         betas=BETAS,
         eps=EPS,
@@ -135,6 +126,7 @@ def train(rank, world_size, args):
         pin_memory=True,
     )
 
+    
     ####################################################################################
     # Load checkpoint if args.resume is set
     ####################################################################################
@@ -142,7 +134,7 @@ def train(rank, world_size, args):
     if args.resume is not None:
         global_step, best_loss = load_checkpoint(
             load_path=args.resume,
-            hubert=hubert,
+            hubert=student_dicehubert,
             optimizer=optimizer,
             scaler=scaler,
             rank=rank,
@@ -171,7 +163,9 @@ def train(rank, world_size, args):
     logger.info(f"# of epochs: {n_epochs}")
     logger.info(f"started at epoch: {start_epoch}")
     logger.info("**" * 40 + "\n")
-
+    
+    
+    
     if args.mask:
         average_masked_loss = Metric()
         average_unmasked_loss = Metric()
@@ -192,10 +186,11 @@ def train(rank, world_size, args):
     validation_loss = Metric()
     validation_accuracy = Metric()
 
+    
     for epoch in range(start_epoch, n_epochs + 1):
         train_sampler.set_epoch(epoch)
 
-        hubert.train()
+        student_dicehubert.train()
         if args.mask:
             epoch_masked_loss.reset()
             epoch_unmasked_loss.reset()
@@ -216,7 +211,7 @@ def train(rank, world_size, args):
             optimizer.zero_grad()
 
             with amp.autocast():
-                logits, mask = hubert(wavs)
+                logits, mask = student_dicehubert(wavs)
                 length = min(
                     mask.size(-1) if args.mask else float("inf"), codes.size(-1)
                 )
@@ -235,7 +230,7 @@ def train(rank, world_size, args):
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
 
-            nn.utils.clip_grad_norm_(hubert.parameters(), MAX_NORM)
+            nn.utils.clip_grad_norm_(student_dicehubert.parameters(), MAX_NORM)
 
             scaler.step(optimizer)
             scaler.update()
@@ -316,15 +311,15 @@ def train(rank, world_size, args):
             # --------------------------------------------------------------------------#
 
             if global_step % VALIDATION_INTERVAL == 0:
-                hubert.eval()
+                student_dicehubert.eval()
                 validation_loss.reset()
                 validation_accuracy.reset()
                 for wavs, codes in validation_loader:
                     wavs, codes = wavs.to(rank), codes.to(rank)
 
                     with torch.no_grad():
-                        logits, _ = hubert(wavs)
-                        logits = logits.transpose(1, 2)
+                        logits, _ = student_dicehubert(wavs)
+                        logits = logits.tranHuBERTspose(1, 2)
 
                     loss = F.cross_entropy(logits, codes)
 
@@ -338,7 +333,7 @@ def train(rank, world_size, args):
                     validation_loss.update(loss.item())
                     validation_accuracy.update(accuracy.item())
 
-                hubert.train()
+                student_dicehubert.train()
 
                 ############################################################################
                 # Log validation metrics
@@ -372,7 +367,7 @@ def train(rank, world_size, args):
                     if rank == 0:
                         save_checkpoint(
                             checkpoint_dir=args.checkpoint_dir,
-                            hubert=hubert,
+                            hubert=student_dicehubert,
                             optimizer=optimizer,
                             scaler=scaler,
                             step=global_step,
@@ -399,7 +394,6 @@ def train(rank, world_size, args):
         # ==================================================================================#
         # End training loop
         # ==================================================================================#
-
     dist.destroy_process_group()
 
 
