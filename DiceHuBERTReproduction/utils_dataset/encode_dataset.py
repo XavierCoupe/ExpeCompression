@@ -60,6 +60,20 @@ def init_pool(output_dir:Path, encoder_type:str, manager:multiprocessing.Manager
 
 def encode_wav(path):
 
+    all_path = path.split("LibriSpeech")[1]
+    split_path = all_path.split("/")
+    save_path = "/".join(split_path[: len(split_path)-1])[1:]
+    
+    file_name = all_path.split("/")[-1]
+    
+    path_pathlib = Path(save_path)
+    absolute_path = Path(pathlib.PurePath(save_dir, path_pathlib))
+
+    # Verification si le fichier a déjà été traité
+    exist_file = Path(str(absolute_path) + "/" + file_name + ".npy")
+    if exist_file.is_file():
+        return 
+    
     wav, _ = torchaudio.load(str(path) + ".flac")
     
     ####
@@ -74,14 +88,7 @@ def encode_wav(path):
     # Save encode wav
     ####
     
-    all_path = path.split("LibriSpeech")[1]
-    split_path = all_path.split("/")
-    save_path = "/".join(split_path[: len(split_path)-1])[1:]
     
-    file_name = all_path.split("/")[-1]
-    
-    path = Path(save_path)
-    absolute_path = Path(pathlib.PurePath(save_dir, path))
     absolute_path.mkdir(parents=True, exist_ok=True)
 
     data = outputs.last_hidden_state.numpy()
