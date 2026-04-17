@@ -4,13 +4,14 @@ import random
 
 from sklearn.cluster import KMeans
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class HubertNarrow(nn.Module):
-    def __init__(self, num_label_embeddings: int = 100, mask: bool = True):
+    def __init__(self, num_label_embeddings: int = 50, mask: bool = True):
         super().__init__()
         self._mask = mask
         self.feature_extractor = FeatureExtractor()
@@ -27,7 +28,7 @@ class HubertNarrow(nn.Module):
         self.proj = nn.Linear(768, 128) # ==> Modification de la taille des représentations
 
         self.masked_spec_embed = nn.Parameter(torch.FloatTensor(768).uniform_())
-        self.label_embedding = nn.Embedding(num_label_embeddings, 128) # ==> Modification de la taille des représentations
+        self.label_embedding = nn.Embedding(num_label_embeddings, 128)
 
     def mask(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         mask = None
@@ -48,26 +49,32 @@ class HubertNarrow(nn.Module):
         return x, mask
 
     def logits(self, x: torch.Tensor) -> torch.Tensor:
-        logits = torch.cosine_similarity(
+        cosine = nn.CosineSimilarity(dim=-1)
+        logits = cosine(
+            x.unsqueeze(2),
+            self.label_embedding.weight.unsqueeze(0).unsqueeze(0),
+        )
+        """logits = torch.cosine_similarity(
             x.unsqueeze(2),
             self.label_embedding.weight.unsqueeze(0).unsqueeze(0),
             dim=-1,
-        )
+        )""" # ==> Voir article hubert, format de sortie (tester une couche lineaire à la place)
         return logits / 0.1
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x, mask = self.encode(x)
         x = self.proj(x)
+        
         logits = self.logits(x)
         return logits, mask
 
 class HubertDiscrete(HubertNarrow):
     """HuBERT-Discrete content encoder from `"A Comparison of Discrete and Soft Speech Units for Improved Voice Conversion"`."""
 
-    def __init__(self, kmeans: KMeans):
-        super().__init__(504)
-        self.kmeans = kmeans
-
+    def __init__(self, nb_class: int):
+        super().__init__()
+        self.nb_class = nb_class
+        
     @torch.inference_mode()
     def units(self, wav: torch.Tensor) -> torch.LongTensor:
         """Extract discrete speech units.
@@ -80,7 +87,6 @@ class HubertDiscrete(HubertNarrow):
         """
         wav = F.pad(wav, ((400 - 320) // 2, (400 - 320) // 2))
         x, _ = self.encode(wav, layer=7)
-        x = self.kmeans.predict(x.squeeze().cpu().numpy())
         return torch.tensor(x, dtype=torch.long, device=wav.device)
 
 class FeatureExtractor(nn.Module):
@@ -218,3 +224,65 @@ def _compute_mask(
     mask = mask.scatter(1, mask_idxs, True)
 
     return mask
+
+if __name__ == "__main__":
+    # This import is used for testing    
+    import torch.distributed as dist
+    
+    from dataset import AcousticUnitsDataset
+    from pathlib import Path
+    from torch.utils.data import DataLoader
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    
+    BATCH_SIZE = 256
+    NB_CENTROID = 10
+    
+
+    
+    student_dicehubert = HubertDiscrete(NB_CENTROID)
+
+    train_dataset = AcousticUnitsDataset(
+        root=Path("/lium/corpus/base/LibriSpeech"),
+        root_length=Path("/lium/raid-a/xcoupe/DATA/LibriSpeech"),
+        root_discrete=Path("/lium/scratch/xcoupe/DATA/LibriSpeech/encode/"),
+        force_train_kmeans=False,
+        nb_centroid=NB_CENTROID,
+        train=True,
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        collate_fn=train_dataset.collate,
+        batch_size=BATCH_SIZE,
+        num_workers=6,
+        pin_memory=False,
+        shuffle=False,
+        drop_last=True,
+    )
+
+
+    
+    student_dicehubert.train()
+    for wavs, code in train_loader:
+        print("-----|||DONNEES|||-----")
+        print(" === wavs === ")
+        print(wavs)
+        print(wavs.shape)
+
+        print(" === code === ")
+        print(code)
+        print(code.shape)
+        
+        print("== Inférence...")
+        
+        logits, mask = student_dicehubert(wavs)
+
+        print(" === Mask === ")
+        print(mask.shape)
+        print(mask)
+
+        print(" === Logits === ")
+        print(logits.shape)
+        print(logits)
+
+
+        break
