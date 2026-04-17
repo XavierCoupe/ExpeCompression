@@ -24,17 +24,22 @@ class AcousticUnitsDataset(Dataset):
         label_rate: int = 50,
         min_samples: int = 32000,
         max_samples: int = 250000,
-        nb_centroid: int = 500,
+        nb_centroid: int = 50,
         batch_size: int = 256,
         seed: int = 20,
         nb_dim: int = 200, # Nombre de dimension à garder pour le kmeans
         force_train_kmeans: bool = False,
+        avr_time_per_file: int = 20, # Temps moyen par fichier en seconde
+        take_all_file: bool = False, # Prendre tous les fichiers pour apprendre le kmeans
         train: bool = True,
     ):
         self.nb_dim = nb_dim
+        
+        self.nb_file_per_split = (100 * 3600) // avr_time_per_file
+        self.take_all_file = take_all_file
         self.wavs_dir = root
         self.units_dir = root_discrete
-
+    
         self.kmeans = MiniBatchKMeans(n_clusters=nb_centroid, 
                                                init="k-means++",
                                                random_state=seed,
@@ -53,16 +58,24 @@ class AcousticUnitsDataset(Dataset):
             with open(str(model_path) + "/" + model_name + ".pkl", 'rb') as f:
                 self.kmeans = pickle.load(f)
         else :
-            # Sélection de 10% du dataset pour fit le kmeans
+            
             if force_train_kmeans :
                 print("[MODEL] Réapprentissage du modèle...")
             print("[MODEL] Préparation des données pour apprentissage...")
-            kmeans_pattern = "train-clean-100/**/*.npy"
-    
-            kmeans_metadata = (
-                (path, path.relative_to(self.units_dir).with_suffix("").as_posix())
-                for path in self.units_dir.rglob(kmeans_pattern)
-            )
+
+            # Sélection de 10% du dataset pour fit le kmeans
+            kmeans_patterns = ["train-clean-100/**/*.npy"]#"train-clean-360/**/*.npy", "train-clean-500/**/*.npy"]
+            kmeans_metadata = list()
+            for kmeans_pattern in kmeans_patterns :
+                total_file = 0
+                for path in self.units_dir.rglob(kmeans_pattern):
+                    data = (path, path.relative_to(self.units_dir).with_suffix("").as_posix())
+                    kmeans_metadata.append(data)
+
+                    if not self.take_all_file :
+                        total_file += 1
+                        if total_file >= self.nb_file_per_split:
+                            break
 
             kmeans_corpus = list()
             for path, key in tqdm.tqdm(list(kmeans_metadata)):
@@ -89,7 +102,8 @@ class AcousticUnitsDataset(Dataset):
             with open(str(model_path) + "/" + model_name + ".pkl",'wb') as f:
                 pickle.dump(self.kmeans,f)
         
-        pattern = "train-*/**/*.flac" if train else "dev-*/**/*.flac"
+        #pattern = "train-*/**/*.flac" if train else "dev-*/**/*.flac"
+        pattern = "train-clean-100/**/*.flac" if train else "dev-*/**/*.flac"
         metadata = (
             (path, path.relative_to(self.wavs_dir).with_suffix("").as_posix())
             for path in self.wavs_dir.rglob(pattern)
@@ -115,29 +129,14 @@ class AcousticUnitsDataset(Dataset):
         wav_path = Path(wav_path)
         units_path = self.units_dir / wav_path.relative_to(self.wavs_dir)
 
-        wav, _ = torchaudio.load(str(wav_path) + ".flac")
+        wav, sr = torchaudio.load(str(wav_path) + ".flac")
         wav = F.pad(wav, ((400 - 320) // 2, (400 - 320) // 2))
 
         codes = np.load(units_path.with_suffix(".npy"))
         codes = np.squeeze(codes, axis=0)
-        
+
         # prediction des centroids
-        if codes.shape[0] > self.nb_dim:
-            idx = random.randint(0, codes.shape[0] - self.nb_dim)
-            codes = codes[idx:idx+self.nb_dim,:]
-
-        else :
-            # Ajout de padding
-            target_size = (self.nb_dim,codes.shape[1])
-
-
-            padded = np.zeros(target_size, dtype=codes.dtype)
-            padded[:codes.shape[0], :] = codes
-            codes = padded
-
-        
         predict_codes = self.kmeans.predict(codes)
-        
         return wav, torch.from_numpy(predict_codes).long()
 
     def collate(self, batch):
@@ -204,6 +203,7 @@ class AcousticUnitsDataset(Dataset):
             collated_codes.append(sliced)
         
         # === STACK ===
+        
         wavs = torch.stack(collated_wavs, dim=0)
         codes = torch.stack(collated_codes, dim=0)
         
@@ -218,13 +218,14 @@ if __name__ == "__main__":
     # This import is used for testing    
     from torch.utils.data import DataLoader
 
-    BATCH_SIZE = 32
+    BATCH_SIZE = 256
     
     train_dataset = AcousticUnitsDataset(
         root=Path("/lium/corpus/base/LibriSpeech"),
         root_length=Path("/lium/raid-a/xcoupe/DATA/LibriSpeech"),
         root_discrete=Path("/lium/scratch/xcoupe/DATA/LibriSpeech/encode/"),
         force_train_kmeans=False,
+        nb_centroid=50,
         train=True,
     )
     train_loader = DataLoader(
