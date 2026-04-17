@@ -3,10 +3,11 @@ import logging
 from pathlib import Path
 
 import torch
-import torch.cuda.amp as amp
+import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import warnings
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torch.distributed as dist
@@ -19,14 +20,16 @@ from student.model import HubertDiscrete
 from student.dataset import AcousticUnitsDataset
 from student.utils import Metric, save_checkpoint, load_checkpoint
 
+from sklearn.cluster import MiniBatchKMeans
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+warnings.filterwarnings("ignore")
 
 ########################################################################################
 # Define hyperparameters for training:
 ########################################################################################
 
-BATCH_SIZE = 32
+BATCH_SIZE = 256
 LEARNING_RATE = 2e-5
 BETAS = (0.9, 0.98)
 EPS = 1e-06
@@ -37,7 +40,9 @@ LOG_INTERVAL = 5
 VALIDATION_INTERVAL = 1000
 CHECKPOINT_INTERVAL = 5000
 BACKEND = "nccl"
-INIT_METHOD = "tcp://localhost:54321"
+INIT_METHOD = "tcp://localhost:6006"
+NB_CENTROID = 50
+TF_ENABLE_ONEDNN_OPTS=0
 
 
 def train(rank, world_size, args):
@@ -76,14 +81,13 @@ def train(rank, world_size, args):
     ###
     # Initialize Student
     ###
-
-    student_dicehubert = HubertDiscrete(mask=args.mask).to(rank)
+    student_dicehubert = HubertDiscrete(NB_CENTROID).to(rank)
     student_dicehubert = DDP(student_dicehubert, device_ids=[rank])
 
 
     ####################################################################################
     # Initialize optimizer and grad scaler
-    ####################################################################################
+    #######################################étroit#############################################
 
     optimizer = optim.AdamW(
         student_dicehubert.parameters(),
@@ -92,38 +96,51 @@ def train(rank, world_size, args):
         eps=EPS,
         weight_decay=WEIGHT_DECAY,
     )
-    scaler = amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
 
     ####################################################################################
     # Initialize datasets and dataloaders
     ####################################################################################
 
+    
     train_dataset = AcousticUnitsDataset(
-        root=args.dataset_dir,
+        root=Path("/lium/corpus/base/LibriSpeech"),
+        root_length=Path("/lium/raid-a/xcoupe/DATA/LibriSpeech"),
+        root_discrete=Path("/lium/scratch/xcoupe/DATA/LibriSpeech/encode/"),
+        force_train_kmeans=False,
+        nb_centroid=NB_CENTROID,
+        take_all_file=True,
         train=True,
     )
+    
     train_sampler = DistributedSampler(train_dataset, drop_last=True)
     train_loader = DataLoader(
         train_dataset,
         collate_fn=train_dataset.collate,
         batch_size=BATCH_SIZE,
         sampler=train_sampler,
-        num_workers=8,
-        pin_memory=True,
+        num_workers=6,
+        pin_memory=False,
         shuffle=False,
         drop_last=True,
     )
+    
 
     validation_dataset = AcousticUnitsDataset(
-        root=args.dataset_dir,
+        root=Path("/lium/corpus/base/LibriSpeech/"),
+        root_length=Path("/lium/raid-a/xcoupe/DATA/LibriSpeech"),
+        root_discrete=Path("/lium/scratch/xcoupe/DATA/LibriSpeech/encode/"),
+        nb_centroid=NB_CENTROID,
         train=False,
     )
     validation_loader = DataLoader(
         validation_dataset,
-        batch_size=1,
+        collate_fn=train_dataset.collate,
+        batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=8,
-        pin_memory=True,
+        num_workers=6,
+        pin_memory=False,
+        drop_last=True,
     )
 
     
@@ -187,7 +204,7 @@ def train(rank, world_size, args):
     validation_accuracy = Metric()
 
     
-    for epoch in range(start_epoch, n_epochs + 1):
+    for epoch in range(start_epoch,n_epochs + 1):
         train_sampler.set_epoch(epoch)
 
         student_dicehubert.train()
@@ -210,11 +227,12 @@ def train(rank, world_size, args):
 
             optimizer.zero_grad()
 
-            with amp.autocast():
+            with amp.autocast('cuda'):
                 logits, mask = student_dicehubert(wavs)
+                
                 length = min(
                     mask.size(-1) if args.mask else float("inf"), codes.size(-1)
-                )
+                ) 
                 logits = logits[:, :length, :]
                 codes = codes[:, :length]
                 if args.mask:
@@ -228,7 +246,7 @@ def train(rank, world_size, args):
                     loss = F.cross_entropy(logits.transpose(1, 2), codes)
 
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            #scaler.unscale_(optimizer)
 
             nn.utils.clip_grad_norm_(student_dicehubert.parameters(), MAX_NORM)
 
@@ -296,7 +314,7 @@ def train(rank, world_size, args):
                     writer.add_scalar(
                         "train/loss",
                         average_loss.value,
-                        global_step,
+                        global_step,torch.Size([256, 50, 104])
                     )
                     writer.add_scalar(
                         "train/accuracy",
@@ -305,30 +323,35 @@ def train(rank, world_size, args):
                     )
                     average_loss.reset()
                     average_accuracy.reset()
+                
 
             # --------------------------------------------------------------------------#
             # Start validation loop
             # --------------------------------------------------------------------------#
 
-            if global_step % VALIDATION_INTERVAL == 0:
+            #if global_step % VALIDATION_INTERVAL == 0:
+            if True:
+                print("=== Affichage Eval===")
                 student_dicehubert.eval()
                 validation_loss.reset()
                 validation_accuracy.reset()
                 for wavs, codes in validation_loader:
                     wavs, codes = wavs.to(rank), codes.to(rank)
 
+                    
                     with torch.no_grad():
                         logits, _ = student_dicehubert(wavs)
-                        logits = logits.tranHuBERTspose(1, 2)
 
-                    loss = F.cross_entropy(logits, codes)
+                    
 
-                    accuracy = logits.argmax(dim=1) == codes
+                    loss = F.cross_entropy(logits.transpose(1, 2), codes) 
+                    
+                    accuracy = logits.argmax(dim=-1) == codes
                     accuracy = torch.mean(accuracy.float())
 
                     ####################################################################
                     # Update validation metrics
-                    ####################################################################
+                    ##########################B_##########################################
 
                     validation_loss.update(loss.item())
                     validation_accuracy.update(accuracy.item())
@@ -342,7 +365,7 @@ def train(rank, world_size, args):
                 if rank == 0:
                     writer.add_scalar(
                         "validation/unit_loss",
-                        validation_loss.value,
+                        validation_loss.valueEER ,
                         global_step,
                     )
                     writer.add_scalar(
